@@ -1,0 +1,16 @@
+[project]
+name = "weconnect-integration"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "ruff>=0.9.5",
+    "weconnect[Images]",
+    "python-dotenv",
+    "pymongo[srv]",
+    "pydantic",
+    "pytest",
+]
+[tool.pytest.ini_options]
+pythonpath = "src"
