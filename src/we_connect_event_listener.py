@@ -1,6 +1,6 @@
 import logging
 import os
-from time import sleep
+from time import sleep, time
 from logging.handlers import RotatingFileHandler
 
 from dotenv import load_dotenv
@@ -87,6 +87,9 @@ def main_loop():
         Function runs indefinitely until process is terminated
     """
     global reconnect_required # pylint: disable=global-statement
+    last_cleanup_time = time.time()
+    cleanup_interval = 86400  # 24 hours in seconds
+    
     while True:
         try:
             logger.info("Initialize WeConnect user:%s pass:%s", username, password)
@@ -110,7 +113,15 @@ def main_loop():
             reconnect_required = False  # reset before update loop
             while not reconnect_required:
                 we_connect.update()
+                
+                # Run periodic cleanup
+                current_time = time.time()
+                if current_time - last_cleanup_time > cleanup_interval:
+                    cleanup_duplicate_parking_events()
+                    last_cleanup_time = current_time
+                    
                 sleep(300)
+                
         except (ConnectionError, RetrievalError,TooManyRequestsError,SetterError,ControlError,AuthentificationError,TemporaryAuthentificationError,APICompatibilityError,APIError) as e:
             logger.error("Exception in main loop: %s", e)
         finally:
@@ -148,7 +159,7 @@ def on_we_connect_error(error):
 def on_we_connect_event(element, flags):
     """
     Event handler for WeConnect events that processes changes in addressable attributes.
-    Added exception handling to log unexpected errors.
+    Prevents duplicate parking events from being stored in MongoDB.
     """
     try:
         if isinstance(element, addressable.AddressableAttribute):
@@ -157,7 +168,34 @@ def on_we_connect_event(element, flags):
             elif flags & addressable.AddressableLeaf.ObserverEvent.VALUE_CHANGED:
                 ga = element.getGlobalAddress()
                 logger.debug("Value changed: %s: %s last change: %s", ga, element.value, element.lastChange)
-                # Handle token or attribute specific logic here...
+                
+                # Handle parking position data
+                if ga.endswith("parkingPosition/carCapturedTimestamp"):
+                    doc = collection.find_one({"status": "longitude received"}, sort=[("timestamp", DESCENDING)])
+                    if doc:
+                        # Check for existing complete parking entry with same values
+                        timestamp_value = element.value
+                        existing_entry = collection.find_one({
+                            "latitude": doc["latitude"],
+                            "longitude": doc["longitude"],
+                            "carCapturedTimestamp": timestamp_value,
+                            "status": "carCapturedTimestamp received"
+                        })
+                        
+                        if existing_entry:
+                            logger.info("Duplicate parking event detected - skipping insert")
+                            # Delete the incomplete document since we already have a complete one
+                            collection.delete_one({"_id": doc["_id"]})
+                        else:
+                            # No duplicate, update the document normally
+                            collection.update_one(
+                                {"_id": doc["_id"]},
+                                {"$set": {"carCapturedTimestamp": timestamp_value, 
+                                          "status": "carCapturedTimestamp received"}}
+                            )
+                            logger.info("Entry updated with id: %s", doc['_id'])
+                
+                # Rest of the handling logic remains unchanged
                 if "access/accessStatus/" in ga:
                     if ga.endswith("doors/frontLeft/lockState"):
                         # Convert enum to string if needed
@@ -247,10 +285,48 @@ def on_we_connect_event(element, flags):
                             {"$set": {"carCapturedTimestamp": element.value, "status": "carCapturedTimestamp received"}}
                         )
                         logger.info("Entry updated with id: %s", doc['_id'])
+                    
             elif flags & addressable.AddressableLeaf.ObserverEvent.DISABLED:
                 logger.info("Attribute is not available anymore: %s", element.getGlobalAddress())
     except Exception as ex:
         logger.exception("Exception in on_we_connect_event: %s", ex)
+
+def cleanup_duplicate_parking_events():
+    """
+    Removes duplicate parking events from MongoDB.
+    Duplicates are defined as having identical latitude, longitude, and carCapturedTimestamp values.
+    """
+    try:
+        # Find all completed parking events
+        completed_events = collection.find({"status": "carCapturedTimestamp received"})
+        
+        # Group by the three key fields
+        seen_events = {}
+        duplicate_ids = []
+        
+        for event in completed_events:
+            key = (event.get("latitude"), event.get("longitude"), event.get("carCapturedTimestamp"))
+            
+            # Skip if any key component is missing
+            if None in key:
+                continue
+                
+            if key in seen_events:
+                # This is a duplicate, mark for deletion (keep the earliest one)
+                duplicate_ids.append(event["_id"])
+            else:
+                seen_events[key] = event["_id"]
+        
+        # Delete duplicates
+        if duplicate_ids:
+            result = collection.delete_many({"_id": {"$in": duplicate_ids}})
+            logger.info("Removed %d duplicate parking events", result.deleted_count)
+    
+    except Exception as ex:
+        logger.exception("Error cleaning up duplicate parking events: %s", ex)
+
+# Call the cleanup function periodically (e.g., once per day)
+# You can add this to your main loop with a time-based check
 
 if __name__ == "__main__":
     main_loop()
